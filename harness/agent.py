@@ -104,8 +104,9 @@ you switch the addendum on, measure your own efficiency delta with
 
 from __future__ import annotations
 
+import json
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 from arena.model import (
     ARENA_SYSTEM_PROMPT,
@@ -591,7 +592,8 @@ class ReActAgent:
         submitted if the run ends without a real FINAL, so a guard can
         only buy a turn, never lose a report.
         """
-        parsed = parse_output(_canonicalise(text))
+        canonical = _canonicalise(text)
+        parsed = _recover_action_args(canonical, parse_output(canonical))
         if parsed.kind != "final":
             return parsed
 
@@ -667,7 +669,7 @@ class ReActAgent:
         if name == "search":
             return self.tools.search(_as_text(args.get("query")), k=_as_k(args.get("k")))
         if name == "fetch_doc":
-            return self.tools.fetch_doc(_as_text(args.get("doc_id")))
+            return self.tools.fetch_doc(_as_doc_id(args))
         if name == "calc":
             return self.tools.calc(_as_text(args.get("expression")) or "0")
         return ToolResult(ok=False, content="", error=f"unknown tool: {name!r}")
@@ -675,6 +677,73 @@ class ReActAgent:
 
 def _as_text(value) -> str:
     return value if isinstance(value, str) else ("" if value is None else str(value))
+
+
+_DOC_ID_ARG_RE = re.compile(r"\bdoc-\d{4}\b", re.IGNORECASE)
+_ACTION_PAYLOAD_RE = re.compile(r"^ACTION:[ \t]*(\{.*\})[ \t]*$", re.MULTILINE)
+
+
+def _recover_action_args(text: str, parsed):
+    """Recover misplaced tool args without replacing the frozen parser.
+
+    The frozen codec still decides whether a turn is an ACTION and which
+    tool it names.  This only handles a common real-endpoint drift where
+    the same JSON puts arguments at the top level or under
+    ``parameters``/``arguments`` instead of the documented ``args``.
+    """
+    if parsed.kind != "action" or parsed.args:
+        return parsed
+    match = _ACTION_PAYLOAD_RE.search(text)
+    if match is None:
+        return parsed
+    try:
+        payload = json.loads(match.group(1))
+    except (TypeError, ValueError):
+        return parsed
+    if not isinstance(payload, dict):
+        return parsed
+
+    for key in ("parameters", "arguments", "input"):
+        candidate = payload.get(key)
+        if isinstance(candidate, dict) and candidate:
+            return replace(parsed, args=candidate)
+
+    candidate = payload.get("args")
+    if isinstance(candidate, str):
+        key = {"search": "query", "fetch_doc": "doc_id", "calc": "expression"}.get(
+            parsed.tool
+        )
+        return replace(parsed, args={key: candidate}) if key else parsed
+    if isinstance(candidate, list) and candidate:
+        key = {"search": "query", "fetch_doc": "doc_id", "calc": "expression"}.get(
+            parsed.tool
+        )
+        return replace(parsed, args={key: candidate[0]}) if key else parsed
+
+    top_level = {
+        key: value
+        for key, value in payload.items()
+        if key not in {"tool", "args", "parameters", "arguments", "input"}
+    }
+    return replace(parsed, args=top_level) if top_level else parsed
+
+
+def _as_doc_id(args: dict) -> str:
+    """Read a document id without weakening the tool boundary.
+
+    Real endpoints sometimes rename the clearly documented ``doc_id``
+    argument to a familiar alias.  Accept only a value that the model
+    actually wrote and that still has the arena's exact ``doc-####``
+    shape; the real tool remains responsible for proving it exists.
+    """
+    aliases = ("doc_id", "docId", "document_id", "documentId", "id")
+    values = [args[key] for key in aliases if key in args]
+    values.extend(value for key, value in args.items() if key not in aliases)
+    for value in values:
+        match = _DOC_ID_ARG_RE.search(_as_text(value))
+        if match:
+            return match.group(0).lower()
+    return ""
 
 
 def _as_k(value) -> int:

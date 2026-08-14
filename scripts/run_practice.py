@@ -215,6 +215,8 @@ def _diagnostic(result, corpus) -> dict:
         "tool_failures": 0,
         "tool_failures_by_name": {},
         "flaky_modes": {},
+        "tool_call_details": [],
+        "model_call_details": [],
     }
 
     report = result.report if isinstance(result.report, dict) else {}
@@ -270,8 +272,21 @@ def _diagnostic(result, corpus) -> dict:
                 record = json.loads(line)
             except Exception:
                 continue
-            if not isinstance(record, dict) or record.get("event") != "tool_call":
+            if not isinstance(record, dict):
                 continue
+            if record.get("event") == "model_call":
+                diag["model_call_details"].append(
+                    {"output_text": str(record.get("output_text", ""))[:1200]}
+                )
+                continue
+            if record.get("event") != "tool_call":
+                continue
+            detail = {
+                key: record.get(key)
+                for key in ("name", "ok", "query", "doc_id", "k", "flaky_mode")
+                if key in record
+            }
+            diag["tool_call_details"].append(detail)
             mode = record.get("flaky_mode")
             if isinstance(mode, str) and mode and mode != "none":
                 diag["flaky_modes"][mode] = diag["flaky_modes"].get(mode, 0) + 1

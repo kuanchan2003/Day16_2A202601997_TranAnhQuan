@@ -73,8 +73,11 @@ from harness.middleware import Middleware
 DEFAULT_RESERVE = 1
 
 NUDGE = (
-    "Ngân sách công cụ đã hết. Hãy trả lời ngay bằng bằng chứng đang có, "
-    f"không gọi thêm công cụ nào nữa. {FINALIZE_SENTINEL}"
+    "Ngân sách công cụ đã hết. Không gọi thêm công cụ. Rà lại toàn bộ kết quả "
+    "fetch_doc thành công đã có trong hội thoại. Nếu một dòng trả lời câu hỏi, "
+    "bắt buộc đặt abstain=false và tạo claim bằng cách chép nguyên văn dòng đó, "
+    "giữ đúng doc_id; chỉ đặt abstain=true khi không có dòng nào làm bằng chứng. "
+    f"Hãy trả lời FINAL ngay. {FINALIZE_SENTINEL}"
 )
 
 
@@ -91,13 +94,20 @@ class BudgetPolicy(Middleware):
         #  limit = ctx.max_tool_calls; None nghĩa là brief không đặt ngân
         #  sách -> chưa bao giờ cạn. Ngược lại:
         #  ctx.tools.calls >= limit - self.reserve
-        return False
+        limit = ctx.max_tool_calls
+        if limit is None:
+            return False  # brief không đặt ngân sách -> không bao giờ cạn
+
+        return ctx.tools.calls >= limit - self.reserve
 
     def before_model(self, ctx, messages):
         # TODO (§3): khoảng 4-6 dòng.
         #  1. Nếu chưa cạn (`not self._spent(ctx)`) -> trả messages nguyên vẹn.
         #  2. Ngược lại: trả về messages + [{"role": "user", "content": NUDGE}]
-        return messages  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        if not self._spent(ctx):
+            return messages  # còn ngân sách -> trả nguyên vẹn
+        # cạn rồi -> thêm lời nhắc ép model dừng
+        return messages + [{"role": "user", "content": NUDGE}]
 
     def wrap_tool_call(self, ctx, call, name, args):
         # TODO (§3): khoảng 4-6 dòng.
@@ -106,4 +116,11 @@ class BudgetPolicy(Middleware):
         #     ToolResult(ok=False, content="", error="<lý do>").
         #     Không calling through chính là cách một lớp middleware
         #     "chặn" một hành động — xem harness/middleware.py.
-        return call(name, args)  # <- mặc định KHÔNG LÀM GÌ
+        if not self._spent(ctx):
+            return call(name, args)  # còn ngân sách -> gọi công cụ như bình thường
+        # cạn rồi -> trả về ToolResult(ok=False, content="", error="<lý do>")
+        return ToolResult(
+            ok=False,
+            content="",
+            error="Ngân sách công cụ đã hết. Không gọi thêm công cụ nào nữa.",
+        )

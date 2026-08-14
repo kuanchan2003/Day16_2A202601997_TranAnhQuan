@@ -91,4 +91,72 @@ class Critic(Middleware):
         #     claims = [], citations = [], và viết lại "answer" nói rõ là
         #     không đủ căn cứ.
         #  6. Cập nhật report["citations"] cho khớp với claims còn lại.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims:
+            return report  # không có claim gì để xử lý
+
+        kept = []
+        for claim in claims:
+            text = claim.get("text", "")
+            if not isinstance(text, str):
+                continue  # bỏ claim không hợp lệ
+
+            if text in ctx.observed_text:
+                kept.append(claim)  # có bằng chứng → giữ
+
+            else:
+                # Không có bằng chứng → thử tách câu ghép
+                split = self._try_split(text, ctx)
+                if split is not None:
+                    left_text, left_doc = split[0]
+                    right_text, right_doc = split[1]
+                    kept.append({"text": left_text, "doc_id": left_doc})
+                    kept.append({"text": right_text, "doc_id": right_doc})
+                # else: không tách được → bỏ claim (bịa)
+
+        # Cập nhật report
+        report["claims"] = kept
+
+        # Nếu không còn claim nào → abstain
+        if not kept:
+            report["abstain"] = True
+            report["citations"] = []
+            report["answer"] = "Không đủ căn cứ để trả lời câu hỏi này dựa trên tài liệu đã đọc."
+
+        # Cập nhật citations cho khớp claims còn lại
+        report["citations"] = sorted({c["doc_id"] for c in kept if c.get("doc_id")})
+
+        return report
+
+    def _try_split(self, text, ctx):
+        """Thử tách câu ghép tại ' và '. Trả về ((left, left_doc), (right, right_doc))
+        nếu tách được, ngược lại None."""
+        observed = ctx.observed_text
+        marker = " và "
+        start = 0
+        while True:
+            # 1. Tìm vị trí tiếp theo của marker trong text (kể từ `start`)
+            pos = text.find(marker, start)
+            if pos == -1:
+                break  # không còn " và " nào nữa → không tách được
+            # 2. Tách thành hai nửa (bỏ khoảng trắng thừa hai đầu)
+            left = text[:pos].strip()
+            right = text[pos + len(marker):].strip()
+            # 3. Kiểm tra cả hai nửa đều xuất hiện nguyên văn trong quan sát
+            if left in observed and right in observed:
+                # 4. Tìm tài liệu thật sự chứa mỗi nửa
+                left_doc = self._find_doc(ctx, left)
+                right_doc = self._find_doc(ctx, right)
+                # 5. Chỉ chấp nhận khi tìm thấy và thuộc HAI tài liệu khác nhau
+                if left_doc is not None and right_doc is not None and left_doc != right_doc:
+                    return ((left, left_doc), (right, right_doc))
+            # 6. Chưa được → thử vị trí " và " tiếp theo
+            start = pos + len(marker)
+        return None
+
+    def _find_doc(self, ctx, text):
+        """Trả về doc_id của tài liệu đầu tiên chứa đoạn text, hoặc None."""
+        for doc in ctx.corpus.docs:
+            if text in doc.body:
+                return doc.doc_id
+        return None

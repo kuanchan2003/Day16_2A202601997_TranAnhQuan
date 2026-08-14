@@ -68,16 +68,49 @@ class CitationChecker(Middleware):
     name = "citation_checker"
 
     def after_agent(self, ctx, report):
-        # TODO (§11): khoảng 10-25 dòng.
-        #  1. Lấy report["claims"]; bỏ qua nếu rỗng hoặc ctx.corpus là None.
-        #  2. Với mỗi claim, gọi ctx.corpus.get(claim["doc_id"]).
-        #     Nếu tài liệu tồn tại VÀ claim["text"] khớp NGUYÊN VĂN một
-        #     DÒNG trong body của nó (không phải chỉ "nằm trong body")
-        #     -> trích dẫn đã đúng, giữ nguyên claim.
-        #  3. Nếu không: tìm trong ctx.corpus.docs tài liệu đầu tiên thoả
-        #     doc.body in ctx.observed_text  và  claim["text"] khớp
-        #     nguyên văn một DÒNG của doc.body -> đó là nguồn thật.
-        #     Đổi doc_id sang nó, GIỮ NGUYÊN text.
-        #  4. Không tìm được nguồn nào -> để `critic` xử lý, đừng bịa doc_id.
-        #  5. Cập nhật report["citations"] = danh sách doc_id đã sắp xếp.
-        return report  # <- mặc định KHÔNG LÀM GÌ: agent vẫn chạy được
+        claims = report.get("claims")
+        if not isinstance(claims, list) or not claims or ctx.corpus is None:
+            return report  # không có gì để xử lý
+
+        fixed = []
+        for claim in claims:
+            text = claim.get("text", "")
+            if not isinstance(text, str):
+                continue
+            doc_id = claim.get("doc_id", "")
+
+            # 1. Kiểm tra trích dẫn hiện tại có đúng không
+            current = ctx.corpus.get(doc_id) if doc_id else None
+            if current is not None and self._is_line_of(text, current.body):
+                fixed.append(claim)  # đúng rồi → giữ
+                continue
+
+            # 2. Trích dẫn sai → tìm nguồn thật
+            new_doc = self._find_source(ctx, text)
+            if new_doc is not None:
+                # Đổi doc_id, GIỮ NGUYÊN text
+                fixed.append({"text": text, "doc_id": new_doc})
+            else:
+                # Không tìm được nguồn → GIỮ NGUYÊN claim
+                # (để critic chạy sau quyết định: xoá nếu bịa, giữ nếu thật)
+                fixed.append(claim)
+
+        report["claims"] = fixed
+        # Cập nhật citations từ doc_id còn lại (đã sắp xếp)
+        report["citations"] = sorted({c["doc_id"] for c in fixed if c.get("doc_id")})
+
+        return report
+    def _is_line_of(self, text, body):
+        """True nếu text xuất hiện nguyên văn trong MỘT DÒNG của body."""
+        for line in body.splitlines():
+            if text in line:
+                return True
+        return False
+    def _find_source(self, ctx, text):
+        """Tìm doc_id của tài liệu ĐÃ ĐƯỢC QUAN SÁT (fetch sạch) chứa text trong 1 dòng."""
+        observed = ctx.observed_text
+        for doc in ctx.corpus.docs:
+            # điều kiện: tài liệu đã fetch sạch VÀ chứa text trong 1 dòng
+            if doc.body in observed and self._is_line_of(text, doc.body):
+                return doc.doc_id
+        return None
